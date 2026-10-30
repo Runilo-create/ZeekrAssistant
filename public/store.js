@@ -1,0 +1,33 @@
+export const today=()=>new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Brussels',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+export function demo(){return {dossiers:[{id:1,name:'Demo klant Alex',interest:'Zeekr 7X',notes:'Proefrit gehad. Wacht op overnamevoorstel.',phone:'',email:'',last_contact:today(),sold:0},{id:2,name:'Demo klant Sam',interest:'Zeekr 7GT',notes:'Offerte voorbereiden.',phone:'',email:'',last_contact:today(),sold:0}],tasks:[],history:[],revision:0}}
+const norm=s=>s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim();
+export function interpret(text,state,now=today()){
+ if(/^taak\s*:/i.test(text))return {reply:'Losse taak toevoegen zonder deadline.',updates:[],tasks:[{title:text.replace(/^taak\s*:/i,'').trim(),due:'',dossier_id:null}]};
+ const clean=norm(text),matches=state.dossiers.filter(d=>clean.includes(norm(d.name)));
+ if(matches.length!==1)return {reply:matches.length?'Noem één dossier per update.':'Gebruik de volledige klantnaam zoals in je dossier. Voor een losse taak: “Taak: offerte voorbereiden”.',updates:[],tasks:[]};
+ const d=matches[0];if(d.sold)return {reply:'Dit dossier is al verkocht. Open het voor een handmatige wijziging.',updates:[],tasks:[]};
+ if(/[?]$/.test(text.trim())||/^(wat|hoe|wanneer|toon)\b/.test(clean))return {reply:d.name+': '+(d.notes||'Nog geen notities.'),updates:[],tasks:[]};
+ if(/\b(verkocht|afsluiten)\b/.test(clean))return {reply:'Open het dossier en kies “Dossier afsluiten” om het verkoopbedrag te bewaren.',updates:[],tasks:[]};
+ let due='';const base=new Date(now+'T12:00:00Z');if(/\bmorgen\b/.test(clean)){base.setUTCDate(base.getUTCDate()+1);due=base.toISOString().slice(0,10)}else if(/\bvandaag\b/.test(clean))due=now;else{const day=['zondag','maandag','dinsdag','woensdag','donderdag','vrijdag','zaterdag'].findIndex(x=>new RegExp('\\b'+x+'\\b').test(clean));if(day>=0){base.setUTCDate(base.getUTCDate()+((day-base.getUTCDay()+7)%7||7));due=base.toISOString().slice(0,10)}}
+ const iso=text.match(/\b(\d{4}-\d{2}-\d{2})\b/);if(iso&&!Number.isNaN(Date.parse(iso[1]+'T12:00:00Z')))due=iso[1];
+ const tasks=/\b(bel|bellen|opvolgen|herinner|taak)\b/.test(clean)?[{title:text.trim(),due,dossier_id:d.id}]:[];
+ return {reply:d.name+' bijwerken met je notitie'+(tasks.length?' en een taak'+(due?' voor '+due:' zonder deadline'):'')+'.',updates:[{id:d.id,notes:[d.notes,text.trim()].filter(Boolean).join('\n'),last_contact:now}],tasks};
+}
+export function apply(state,path,body){const next=structuredClone(state);const id=()=>Math.max(0,...next.tasks.map(t=>t.id),...next.dossiers.map(d=>d.id))+1;
+ if(path==='dossier'){if(!body.name?.trim())throw Error('Naam is verplicht.');if(body.id){const d=next.dossiers.find(d=>d.id===Number(body.id));if(!d)throw Error('Dossier niet gevonden.');next.history.push({dossier_id:d.id,at:today(),notes:d.notes});for(const k of ['name','interest','notes','phone','email','last_contact'])d[k]=body[k]||'';d.updated_at=today()}else next.dossiers.push({...body,id:id(),sold:0})}
+ else if(path==='close'){if(!Number.isInteger(body.amount_cents)||body.amount_cents<0)throw Error('Ongeldig verkoopbedrag.');const d=next.dossiers.find(d=>d.id===body.id);if(!d)throw Error('Dossier niet gevonden.');Object.assign(d,{sold:1,amount_cents:body.amount_cents,closed_at:today()})}
+ else if(path==='task'){if(body.id){const t=next.tasks.find(t=>t.id===body.id);if(!t)throw Error('Taak niet gevonden.');t.done=Number(body.done)}else{if(!body.title?.trim())throw Error('Vul een taak in.');next.tasks.push({...body,id:id(),done:0})}}
+ else if(path==='assistant'){for(const u of body.updates){const d=next.dossiers.find(d=>d.id===u.id);next.history.push({dossier_id:d.id,at:today(),notes:d.notes});Object.assign(d,u,{updated_at:today()})}for(const t of body.tasks)next.tasks.push({...t,id:id(),done:0})}
+ else throw Error('Onbekende actie.');next.revision=(next.revision||0)+1;return next;
+}
+export class Store{
+ constructor(config,storage){this.config=config;this.storage=storage;this.session=null;this.current=null;this.version=null}
+ get cloud(){return Boolean(this.config.url&&this.config.key)}
+ async request(path,options={}){const r=await fetch(this.config.url+path,{...options,headers:{apikey:this.config.key,Authorization:'Bearer '+(this.session?.access_token||this.config.key),'Content-Type':'application/json',...options.headers}});const data=await r.json();if(!r.ok){if(r.status===401){this.session=null;this.storage.removeItem('sales-session')}throw Error(data?.msg||data?.message||data?.error_description||'Cloudopslag niet bereikbaar.')}return data}
+ async login(email,password){this.session=await this.request('/auth/v1/token?grant_type=password',{method:'POST',body:JSON.stringify({email,password})});this.storage.setItem('sales-session',JSON.stringify(this.session));return this.read()}
+ async restore(){this.session=JSON.parse(this.storage.getItem('sales-session')||'null');return this.read()}
+ async refresh(){if(this.session?.expires_at*1000<Date.now()+60000){this.session=await this.request('/auth/v1/token?grant_type=refresh_token',{method:'POST',body:JSON.stringify({refresh_token:this.session.refresh_token})});this.storage.setItem('sales-session',JSON.stringify(this.session))}}
+ async read(){if(!this.cloud){this.current=JSON.parse(this.storage.getItem('sales-demo')||'null')||demo();return {...this.current,today:today(),ai:false}}if(!this.session)throw Error('Log in om je dossiers te openen.');await this.refresh();const rows=await this.request('/rest/v1/workspaces?select=data,version&user_id=eq.'+this.session.user.id);if(!rows.length){const empty={dossiers:[],tasks:[],history:[],revision:0};await this.request('/rest/v1/workspaces',{method:'POST',body:JSON.stringify({user_id:this.session.user.id,data:empty,version:0})});this.current=empty;this.version=0}else{this.current=rows[0].data;this.version=rows[0].version}return {...this.current,today:today(),ai:false}}
+ async save(path,body){const next=apply(this.current,path,body);if(this.cloud){await this.refresh();const rows=await this.request('/rest/v1/workspaces?user_id=eq.'+this.session.user.id+'&version=eq.'+this.version,{method:'PATCH',headers:{Prefer:'return=representation'},body:JSON.stringify({data:next,version:this.version+1})});if(!rows.length){await this.read();throw Error('Gewijzigd op een ander toestel. Ververs en probeer opnieuw.')}this.version++}else this.storage.setItem('sales-demo',JSON.stringify(next));this.current=next;return {ok:true}}
+ logout(){this.session=null;this.storage.removeItem('sales-session');this.current=null}
+}

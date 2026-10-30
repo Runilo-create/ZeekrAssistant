@@ -1,0 +1,12 @@
+data/
+__pycache__/
+.env
+
+dist/
+.vercel/
+node_modules/
+
+# Private local customer data and legacy server with embedded dossiers
+supabase/dossiers-import.json
+server.py
+tests/test_server.py
